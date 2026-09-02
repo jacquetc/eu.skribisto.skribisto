@@ -1,30 +1,112 @@
+# Flatpak manifest for Flathub.
+#
+# This is NOT the same manifest as the one in the upstream repo
+# (package/flatpak/eu.skribisto.skribisto.yml). That one builds the working tree
+# through a `type: dir` source, which is right for CI and local builds and cannot
+# work here: Flathub builds this repository, so `../..` would resolve to the
+# parent of THIS checkout, and Flathub does not host application source anyway.
+# The two differ in their sources and in nothing else.
+#
+# Keeping them in step is a real obligation. Whenever the build commands change
+# upstream, they change here too.
 app-id: eu.skribisto.skribisto
-runtime: org.kde.Platform
-runtime-version: '6.10'
-sdk: org.kde.Sdk
+
+# 25.08 rather than 26.08, and not by oversight. The Rust toolchain here comes
+# from org.freedesktop.Sdk.Extension.rust-stable, and that extension has no 26.08
+# branch yet: Flathub's index stops at 25.08, and so does its API. Bumping the
+# runtime alone would leave the build with no compiler. Revisit when the
+# extension ships 26.08.
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: skribisto
+
 finish-args:
-  - --share=ipc
-  - --share=network
+  # winit is Wayland-native; fall back to X11 only when there is no Wayland socket.
   - --socket=wayland
   - --socket=fallback-x11
-  - --filesystem=home
+  - --share=ipc
+  # wgpu Vulkan/GL rendering. The driver arrives via org.freedesktop.Platform.GL.*.
   - --device=dri
-  - --own-name=com.druide.antidote.*
-  - --talk-name=org.freedesktop.Flatpak
-separate-locales: false
-modules: 
+  # ureq/rustls dictionary downloads (rustls uses webpki roots, so no cert grant).
+  - --share=network
+  # Broad Home access, and the linter flags it as finish-args-home-filesystem-access.
+  # Skribisto already holds an exception for this rule, recorded in
+  # flatpak-builder-lint's exceptions.json as "Predates the linter rule".
+  #
+  # The justification, if it is ever re-examined: files are PICKED through the
+  # xdg-desktop-portal FileChooser, but the backup scheduler writes to remembered
+  # destination paths with no portal round trip at write time, and the default
+  # "back up next to the project" writes a sibling file. Neither is covered by a
+  # per-file portal token. Backup destinations on external media outside $HOME are
+  # deliberately out of scope.
+  - --filesystem=home
+
+# Two permissions the C++ app held are deliberately gone, along with any need for
+# their exceptions (finish-args-flatpak-spawn-access,
+# finish-args-own-name-wildcard-com.druide.antidote): the Rust rewrite integrates
+# with neither Antidote nor flatpak-spawn. Verified by grep over crates/.
+
+modules:
   - name: skribisto
-    buildsystem: cmake-ninja
-    builddir: true
-    config-opts:
-      - -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    sources: 
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/skribisto/cargo
+        CARGO_NET_OFFLINE: "true"
+    build-commands:
+      - cargo --offline build --release -p teksilo_ui --features pdf
+      - install -Dm755 target/release/skribisto /app/bin/skribisto
+      - install -Dm644 eu.skribisto.skribisto.metainfo.xml /app/share/metainfo/eu.skribisto.skribisto.metainfo.xml
+      - install -Dm644 resources/unix/applications/eu.skribisto.skribisto.desktop /app/share/applications/eu.skribisto.skribisto.desktop
+      - install -Dm644 resources/unix/mime/eu.skribisto.skribisto.xml /app/share/mime/packages/eu.skribisto.skribisto.xml
+      - install -Dm644 resources/unix/icons/icons/hicolor/scalable/apps/skribisto.svg /app/share/icons/hicolor/scalable/apps/eu.skribisto.skribisto.svg
+      - |
+        for s in 16 32 64 72 96 192 256 512; do
+          src="resources/unix/icons/icons/hicolor/${s}x${s}/apps/skribisto.png"
+          [ -f "$src" ] && install -Dm644 "$src" "/app/share/icons/hicolor/${s}x${s}/apps/eu.skribisto.skribisto.png"
+        done
+      # The .skrib document icon. Its basename MUST start with the app id:
+      # `flatpak build-finish` refuses any other exported filename, and it refuses
+      # by printing a notice rather than failing, so the icon silently never
+      # reaches the host and every project file draws the generic archive glyph.
+      # The MIME entry's <icon name> matches this name for the same reason.
+      - install -Dm644 resources/unix/icons/icons/hicolor/scalable/apps/skribisto.svg /app/share/icons/hicolor/scalable/mimetypes/eu.skribisto.skribisto.project.svg
+      - |
+        for s in 16 32 64 72 96 192 256 512; do
+          src="resources/unix/icons/icons/hicolor/${s}x${s}/apps/skribisto.png"
+          [ -f "$src" ] && install -Dm644 "$src" "/app/share/icons/hicolor/${s}x${s}/mimetypes/eu.skribisto.skribisto.project.png"
+        done
+    sources:
+      # ⚠ The tag MUST be one whose committed Cargo.lock resolves every dependency
+      # from crates.io. v3.0.0-rc2 does NOT: its lockfile still records
+      # text-document as a local path package, so `cargo metadata --locked` fails
+      # there and an offline build is impossible. The first usable tag is one cut
+      # from master at or after the lockfile became consistent.
+      #
+      # Fill both fields from the same tag:
+      #   git rev-list -n1 v3.0.0
       - type: git
         url: https://github.com/jacquetc/skribisto.git
-        tag: v1.9.43
-        commit: 58a73b994305a5b57d4d8fccfeac21f37ea2a1f5
+        tag: v3.0.0
+        commit: "9453b49a2461293e3244cd0abd9dab056ba16426"
         x-checker-data:
           type: git
-          tag-pattern: ^v([\d.]+)
-          versions: {<: '2.0'}
+          # Anchored with $ on purpose. The old pattern had no anchor, so a
+          # pre-release tag like v3.0.0-rc2 matched and yielded "3.0.0" — a
+          # release candidate promoted into Flathub stable. The `versions` cap
+          # that used to sit here (< 2.0) is gone: it existed only to keep the
+          # checker off the 3.x tags while this manifest still built the C++ app.
+          tag-pattern: ^v([\d.]+)$
+          version-scheme: semantic
+
+      # Every crate, vendored, because Flathub builds with no network. Generated
+      # by package/flatpak/gen-cargo-sources.sh in the upstream repo, FROM THE
+      # LOCKFILE OF THE TAG ABOVE. If the two disagree, the build fails offline
+      # with a missing-package error. The external data checker bumps the tag but
+      # cannot regenerate this file (flatpak-external-data-checker#252 is still
+      # open), so the two must be updated together, in one commit.
+      - cargo-sources.json
